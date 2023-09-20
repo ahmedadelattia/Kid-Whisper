@@ -1,69 +1,104 @@
-from transformers import pipeline, WhisperForConditionalGeneration
+from transformers import pipeline, WhisperForConditionalGeneration, WhisperTokenizer
 from transformers import WhisperFeatureExtractor
-from collections import defaultdict
+import os
 from datasets import Dataset, load_dataset, Audio
 import soundfile as sf
-from datasets import load_dataset, Audio
-from transformers import WhisperForConditionalGeneration, WhisperProcessor
-import torch
+import json
+# from whisper_normalizer.english import EnglishTextNormalizer
+from collections import defaultdict
 from evaluate import load
+from tqdm import tqdm
+from transformers.pipelines.pt_utils import KeyDataset
+from Rishabh_norm import RishabhTextNormalizer
 
-def load_data():
-    #load chunks from disk
-    custom_dataset = Dataset.load_from_disk("./data/test")
+def load_data(dataset):
+    datasets = []
+    for ds in os.listdir("./data/test"):
+        if dataset != "all":
+            if ds != dataset:
+                continue
+        dataset = Dataset.load_from_disk("./data/test/" + ds)
+        dataset.name = ds
+
+        dataset = dataset.cast_column("audio_path", Audio())
+        dataset = dataset.rename_column("audio_path", "audio")
+        datasets.append(dataset)
     print("Dataset prepared")
-    print(f"Found {len(custom_dataset)} test examples")
-    assert "input_features" in custom_dataset.column_names, "input_features not in custom_dataset"
-    assert "labels" in custom_dataset.column_names, "labels not in custom_dataset"
-    
-    return custom_dataset
+    print(f"Found {len(datasets)} datasets")
+    for dataset in datasets:
+        assert "input_features" in dataset.column_names, "input_features not in dataset"
+        assert "labels" in dataset.column_names, "labels not in dataset"
+        print(f"Found {len(dataset)} test examples in {dataset.name}")    
+    return datasets
 
 
-def transcribe(model_name):
-    testset = load_data()
-    testset = testset.remove_columns(["input_features"])
-    testset = testset.cast_column("audio_path", Audio())
-    testset = testset.rename_column("audio_path", "audio")
-    # base_model = "openai/" + model_name.split("openai/")[1].split("/")[0]
-    base_model = "openai/whisper-small"
-    processor = WhisperProcessor.from_pretrained(base_model)
-    model = WhisperForConditionalGeneration.from_pretrained(model_name).to("cuda")
 
-    def map_to_pred(batch):
-        audio = batch["audio"]
-        input_features = processor(audio["array"], sampling_rate=audio["sampling_rate"], return_tensors="pt").input_features
-        scentence = processor.decode(batch["labels"])
-        batch["reference"] = processor.tokenizer._normalize(scentence)
-        with torch.no_grad():
-            predicted_ids = model.generate(input_features.to("cuda"))[0]
-        transcription = processor.decode(predicted_ids)
-        batch["prediction"] = processor.tokenizer._normalize(transcription)
-        batch["audio_path"] = batch["audio"]["path"]
-        batch["dataset"] = batch["dataset"]
-        return batch
-
-    result = testset.map(map_to_pred)
-
+def transcribe(model_name, dataset="all"):
+    if "small" in model_name:
+        base_model = "openai/whisper-small"
+    elif "medium" in model_name:
+        base_model = "openai/whisper-medium"
+    elif "large-v2" in model_name:
+        base_model = "openai/whisper-large-v2"
+        
+    else:
+        base_model = model_name
+        # raise ValueError("Model name must contain either small.en or medium.en")
+    if ".en" in model_name and ".en" not in base_model:
+        base_model += ".en"
+    print(f"Base model: {base_model}")
+    if "rishabh" in model_name.lower():
+        normalizer = RishabhTextNormalizer
+        base_model = model_name
+        tokenizer = WhisperTokenizer.from_pretrained(base_model, language="english", task="transcribe")
+        
+    else:
+        tokenizer = WhisperTokenizer.from_pretrained(base_model, language="english", task="transcribe")
+        normalizer = tokenizer._normalize
+        
     metric = load("wer")
-    datasets = defaultdict(lambda: {"ground_truths": [], "hypotheses": []})
-    wer = defaultdict(lambda: 0)
-    for i,batch in enumerate(result):
-        ds = batch["dataset"]
-        datasets[ds]["hypotheses"].append(batch["prediction"])
-        datasets[ds]["ground_truths"].append(batch["reference"])
+    model = WhisperForConditionalGeneration.from_pretrained(model_name)
+    pipe = pipeline(task = "automatic-speech-recognition", model=model, tokenizer=base_model, feature_extractor=WhisperFeatureExtractor.from_pretrained(base_model), device="cuda", chunk_length_s=30,)
+    print(f"Model: {model_name}")
+    print(f"Dataset: {dataset}")
+    print(f"Base model: {base_model}")
         
-    for ds in datasets:
-        wer[ds] = 100*metric.compute(predictions=datasets[ds]["hypotheses"], references=datasets[ds]["ground_truths"])
-        print(f"Dataset: {ds} WER: {wer[ds]}")
+    if dataset == "librispeech":
+        testsets = [load_dataset("librispeech_asr", "clean", split="test")]
+        testsets[0].name = "librispeech"
+        print(testsets[0])
+    else:
+        testsets = load_data(dataset)
+    def transcribe_file(audio):
+        text = pipe(audio)["text"]
+        return text
+    transcription_dir = model_name + "/transcriptions"
+    if "fine-tuned-whisper" not in transcription_dir:
+        transcription_dir = "huggingface_models_transcription/" + transcription_dir
+    os.makedirs(transcription_dir, exist_ok=True)
+    for testset in testsets:
+        datasets = {"ground_truths": [], "hypotheses": []}
+        print(f"Transcribing {testset.name}")
+        transcription_file = transcription_dir + "/" + testset.name + ".txt"
+        transcription_file = open(transcription_file, "w")
+        for out, line in tqdm(zip(pipe(KeyDataset(testset, "audio")), testset), desc=f"Transcribing {testset.name}", total=len(testset)):
+
+            transcription = out["text"]
+            if testset.name == "librispeech":
+                ground_truth = line["text"]
+            else:
+                ground_truth = line["sentence"]
+            path = line["audio"]["path"]
+            datasets["ground_truths"].append(normalizer(ground_truth))
+            datasets["hypotheses"].append(normalizer(transcription))
+            transcription_file.write(path + "\t" + transcription + "\n")
+        wer = metric.compute(predictions=datasets["hypotheses"], references=datasets["ground_truths"]) * 100
+        print("Dataset: {} WER: {}".format(testset.name, wer))
     
-    print(f"{wer}")
-    with open(f"./{model_name}/transcriptions.txt", "w") as f:
-        for i, batch in enumerate(result):
-            transcription = batch["prediction"]
-            line = batch["audio_path"] + "\t" + transcription
-            f.write(f"{line}\n")
-    with open(f"./{model_name}/wer.txt", "w") as f:
-        f.write(f"{wer}")
-        
-        
-transcribe("whisper-small/checkpoint-3000")
+if __name__ == "__main__":
+    import sys
+    model_name = sys.argv[1]
+    #set dataset to "all" by default. Optional argument to specify dataset
+    print(model_name)
+    dataset = sys.argv[2] if len(sys.argv) > 2 else "all"
+    transcribe(model_name, dataset)
