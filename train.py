@@ -3,7 +3,7 @@ from transformers import WhisperFeatureExtractor
 from transformers import WhisperTokenizer
 from transformers import WhisperProcessor
 from transformers import WhisperForConditionalGeneration, WhisperModel
-from whisper_normalizer.english import EnglishTextNormalizer
+# from whisper_normalizer.english import EnglishTextNormalizer
 from transformers import Seq2SeqTrainingArguments
 from transformers import Seq2SeqTrainer
 from transformers import EarlyStoppingCallback
@@ -82,7 +82,7 @@ def get_parser() -> argparse.ArgumentParser:
         "--eval_steps",
         type=int,
         help="Evaluation steps",
-        default=1000,
+        default=None,
     )
     parser.add_argument(
         "--gradient_checkpointing",
@@ -106,13 +106,25 @@ def get_parser() -> argparse.ArgumentParser:
         "--logging_steps",
         type=int,
         help="Logging steps",
-        default=500,
+        default=None,
     )
     parser.add_argument(
         "--save_steps",
         type=int,
         help="Save steps",
-        default=1000,
+        default=None,
+    )
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        help="Dataset to use",
+        default="all",
+    )
+    parser.add_argument(
+        "--patience",
+        type=int,
+        help="Early stopping patience",
+        default=5,
     )
     print("Parser created")
     return parser
@@ -150,20 +162,59 @@ class DataCollatorSpeechSeq2SeqWithPadding:
 
 
 
-def load_data():
+def load_data(dataset, dataset_path):
     #load chunks from disk
-    dataset_chunks = []
-    for i in range(0, 4):
-        chunk = Dataset.load_from_disk("./data/train_chunk_{}".format(i))
-        dataset_chunks.append(chunk)
-    custom_dataset = DatasetDict({"train": concatenate_datasets(dataset_chunks), "development": Dataset.load_from_disk("./data/development")})
+    # dataset_chunks = []
+    # for i in range(0, 4):
+    #     chunk = Dataset.load_from_disk("./data/train_chunk_{}".format(i))
+    #     dataset_chunks.append(chunk)
+    # custom_dataset = DatasetDict({"train": concatenate_datasets(dataset_chunks), "development": Dataset.load_from_disk("./data/development")})
+    # print("Dataset prepared")
+    # print("Found {} training examples and {} development examples".format(len(custom_dataset["train"]), len(custom_dataset["development"])))
+    # assert "input_features" in custom_dataset["train"].column_names, "input_features not in custom_dataset"
+    # assert "labels" in custom_dataset["train"].column_names, "labels not in custom_dataset"
+    # assert "input_features" in custom_dataset["development"].column_names, "input_features not in custom_dataset"
+    # assert "labels" in custom_dataset["development"].column_names, "labels not in custom_dataset"
+    dev_datasets = os.listdir(f"{dataset_path}/development")
+    train_datasets = os.listdir(f"{dataset_path}/train")
+    datasets = train_datasets
+    if dataset != "all":
+        assert dataset in train_datasets, "Dataset {} not found".format(dataset)
+        assert dataset in dev_datasets, "Dataset {} not found".format(dataset)
+        datasets = [dataset]
+    #initialize dataset dict with empty datasets
+    #TODO: I don't like this. Learn how to create an empty dataset dict instead
+    first_train = True
+    first_dev = True
+    
+    for dataset in datasets:
+        assert dataset in dev_datasets, "Dataset {} not found in development".format(dataset)  
+        if first_dev:
+            custom_dataset = DatasetDict({"development": Dataset.load_from_disk(f"{dataset_path}/development/{dataset}")})
+            first_dev = False
+        else:
+            custom_dataset["development"] = concatenate_datasets([custom_dataset["development"], Dataset.load_from_disk(f"{dataset_path}/development/{dataset}")])        
+        if dataset == "myst":
+            for chunck in os.listdir(f"{dataset_path}/train/myst/"):
+                if first_train:
+                    custom_dataset["train"] = Dataset.load_from_disk(f"{dataset_path}/train/myst/{chunck}")
+                    first_train = False
+                else:
+                    custom_dataset["train"] = concatenate_datasets([custom_dataset["train"], Dataset.load_from_disk(f"{dataset_path}/train/myst/{chunck}")])
+        else:
+            if first_train:
+                custom_dataset["train"] = Dataset.load_from_disk(f"{dataset_path}/train/{dataset}")
+                first_train = False
+            else:
+                custom_dataset["train"] = concatenate_datasets([custom_dataset["train"], Dataset.load_from_disk(f"{dataset_path}/train/{dataset}")])
+    #shuffle the training dataset
+    custom_dataset["train"] = custom_dataset["train"].shuffle()
+    #shuffle the development dataset
+    custom_dataset["development"] = custom_dataset["development"].shuffle()
+    #take the first 10 examples from the development dataset
+    # custom_dataset["development"] = custom_dataset["development"].select(range(10))
     print("Dataset prepared")
-    print("Found {} training examples and {} development examples".format(len(custom_dataset["train"]), len(custom_dataset["development"])))
-    assert "input_features" in custom_dataset["train"].column_names, "input_features not in custom_dataset"
-    assert "labels" in custom_dataset["train"].column_names, "labels not in custom_dataset"
-    assert "input_features" in custom_dataset["development"].column_names, "input_features not in custom_dataset"
-    assert "labels" in custom_dataset["development"].column_names, "labels not in custom_dataset"
-
+    print(f"Found {len(custom_dataset['train'])} training examples and {len(custom_dataset['development'])} development examples")
     return custom_dataset
 
 def train(args):
@@ -195,32 +246,38 @@ def train(args):
         # filtering step to only evaluate the samples that correspond to non-zero references
         pred_str = [pred_str[i] for i in range(len(pred_str)) if len(label_str[i]) > 0]
         label_str = [label_str[i] for i in range(len(label_str)) if len(label_str[i]) > 0]
-
         wer = 100 * metric.compute(predictions=pred_str, references=label_str)
-
         return {"wer": wer}
     
-    normalizer = EnglishTextNormalizer()
+
     metric = evaluate.load("wer")
     feature_extractor = WhisperFeatureExtractor.from_pretrained(args.pretrained_model)
-    tokenizer = WhisperTokenizer.from_pretrained(args.pretrained_model, language="english", task="transcribe")
-    processor = WhisperProcessor.from_pretrained(args.pretrained_model, language="english", task="transcribe")
-    custom_dataset = load_data()
+    if "en" in args.pretrained_model:
+        tokenizer = WhisperTokenizer.from_pretrained(args.pretrained_model, language="english", task="transcribe")
+        processor = WhisperProcessor.from_pretrained(args.pretrained_model, language="english", task="transcribe")
+    else:
+        tokenizer = WhisperTokenizer.from_pretrained(args.pretrained_model,  task="transcribe")
+        processor = WhisperProcessor.from_pretrained(args.pretrained_model, task="transcribe")
+    custom_dataset = load_data(args.dataset, args.dataset_path)
+    # normalizer = EnglishTextNormalizer()
+    normalizer = tokenizer._normalize
     model = WhisperForConditionalGeneration.from_pretrained(args.pretrained_model)
     data_collator = DataCollatorSpeechSeq2SeqWithPadding(processor=processor)
-    if ".en" not in args.pretrained_model:
-        model.config.forced_decoder_ids = None #remove forced decoder ids for non-english models
+    # if ".en" not in args.pretrained_model:
+    model.config.forced_decoder_ids = None #remove forced decoder ids for non-english models
     # model.config.forced_decoder_ids = None
     model.config.use_cache = False
     model.config.suppress_tokens = []
-    
+
     if args.num_train_epochs > 0:
         args.max_steps = 0
-        args.evaluation_strategy = "steps"
+        args.evaluation_strategy = "epochs"
         print("Training model for {} epochs".format(args.num_train_epochs))
         print("max steps ignored")
-        
-    output_dir = args.output_dir + "/" +args.pretrained_model +"/lr_{}_warmup_{}_epochs_{}_batch_{}_grad_acc_{}_max_steps_{}".format(args.max_learning_rate, args.warmup_steps, args.num_train_epochs, args.train_batch_size, args.gradient_accumulation_steps, args.max_steps) + "/{}".format(datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
+    else:
+        print("Training model for {} steps".format(args.max_steps))
+        print("num_train_epochs ignored")
+    output_dir = args.output_dir + "/" +args.pretrained_model +"/lr_{}_warmup_{}_epochs_{}_batch_{}_grad_acc_{}_max_steps_{}".format(args.max_learning_rate, args.warmup_steps, args.num_train_epochs, args.train_batch_size, args.gradient_accumulation_steps, args.max_steps) +"/dataset_" + args.dataset + "/{}".format(datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
     os.makedirs(output_dir, exist_ok=True)
     #dump args to file
     with open(output_dir + "/args.json", "w") as f:
@@ -238,6 +295,8 @@ def train(args):
         gradient_checkpointing=args.gradient_checkpointing,
         fp16=args.fp16,
         evaluation_strategy=args.evaluation_strategy,
+        logging_strategy=args.evaluation_strategy,
+        save_strategy=args.evaluation_strategy,
         per_device_eval_batch_size=args.eval_batch_size,
         predict_with_generate=True,
         generation_max_length=225,
@@ -258,7 +317,7 @@ def train(args):
         data_collator=data_collator,
         compute_metrics=compute_metrics,
         tokenizer=processor.feature_extractor,
-        callbacks=[EarlyStoppingCallback(early_stopping_patience=5)],
+        callbacks=[EarlyStoppingCallback(early_stopping_patience=args.patience)],
     )
     
     processor.save_pretrained(training_args.output_dir)
