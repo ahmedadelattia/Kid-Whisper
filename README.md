@@ -8,9 +8,9 @@ Recent advancements in Automatic Speech Recognition (ASR) systems, exemplified b
 
 ## Authors
 
-Contributors names and contact info
+Contributors and authors
 
-Ahmed Adel Attia, Jing Liu, Wei Ai, Dorottya Demszky, Carol Espy-Wilsom
+Ahmed Adel Attia, Jing Liu, Wei Ai, Dorottya Demszky, Carol Espy-Wilson
 
 ## Model Checkpoints
 You can find the model checkpoints on my [Huggingface account](https://huggingface.co/aadel4/)
